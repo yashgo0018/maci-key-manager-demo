@@ -1,12 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import type { Signature } from "maci-crypto";
 import { genRandomSalt } from "maci-crypto";
 import { Keypair, PCommand, PubKey } from "maci-domainobjs";
 import { useContractRead, useContractWrite } from "wagmi";
 import PollAbi from "~~/abi/Poll";
+import VoteInProgress from "~~/app/polls/[id]/_components/VoteInProgress";
 import VoteCard from "~~/components/card/VoteCard";
 import { useAuthContext } from "~~/contexts/AuthContext";
+import { useMaciKeyContext } from "~~/contexts/MaciKeyContext";
 import { useFetchPoll } from "~~/hooks/useFetchPoll";
 import { getPollStatus } from "~~/hooks/useFetchPolls";
 import { PollStatus, PollType } from "~~/types/poll";
@@ -17,7 +20,8 @@ export default function PollDetail({ id }: { id: bigint }) {
   const { data: poll, error, isLoading } = useFetchPoll(id);
   const [pollType, setPollType] = useState(PollType.NOT_SELECTED);
 
-  const { keypair, stateIndex } = useAuthContext();
+  const { stateIndex, isRegistered } = useAuthContext();
+  const { lastSignature, signMessage, publicKey, pendingSignatureId } = useMaciKeyContext();
 
   const [votes, setVotes] = useState<{ index: number; votes: number }[]>([]);
 
@@ -26,6 +30,77 @@ export default function PollDetail({ id }: { id: bigint }) {
   const isAnyInvalid = Object.values(isVotesInvalid).some(v => v);
   const [result, setResult] = useState<{ candidate: string; votes: number }[] | null>(null);
   const [status, setStatus] = useState<PollStatus>();
+
+  const [requiredSignatures, setRequiredSignatures] = useState<{
+    messages: {
+      messageHash: string;
+      pollIndex: bigint;
+      candidateIndex: bigint;
+      weight: bigint;
+      nonce: bigint;
+    }[];
+    signatureId: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (
+      !requiredSignatures ||
+      requiredSignatures.signatureId !== lastSignature?.signatureId ||
+      stateIndex === null ||
+      !coordinatorPubKey ||
+      !publicKey
+    )
+      return;
+
+    const votesToMessage = requiredSignatures.messages.map(v =>
+      encryptSignature(
+        stateIndex,
+        v.pollIndex,
+        v.candidateIndex,
+        v.weight,
+        v.nonce,
+        coordinatorPubKey,
+        publicKey,
+        lastSignature.signature,
+      ),
+    );
+
+    setRequiredSignatures(null);
+
+    (async () => {
+      try {
+        if (votesToMessage.length === 1) {
+          await publishMessage({
+            args: [
+              votesToMessage[0].message.asContractParam() as unknown as {
+                msgType: bigint;
+                data: readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
+              },
+              votesToMessage[0].encKeyPair.pubKey.asContractParam() as unknown as { x: bigint; y: bigint },
+            ],
+          });
+        } else {
+          await publishMessageBatch({
+            args: [
+              votesToMessage.map(
+                v =>
+                  v.message.asContractParam() as unknown as {
+                    msgType: bigint;
+                    data: readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
+                  },
+              ),
+              votesToMessage.map(v => v.encKeyPair.pubKey.asContractParam() as { x: bigint; y: bigint }),
+            ],
+          });
+        }
+
+        notification.success("Vote casted successfully");
+      } catch (err) {
+        console.log("err", err);
+        notification.error("Casting vote failed, please try again ");
+      }
+    })();
+  }, [lastSignature?.signatureId, requiredSignatures?.signatureId]);
 
   useEffect(() => {
     if (!poll || !poll.metadata) {
@@ -107,7 +182,7 @@ export default function PollDetail({ id }: { id: bigint }) {
   }, [coordinatorPubKeyResult]);
 
   const castVote = async () => {
-    if (!poll || stateIndex == null || !coordinatorPubKey || !keypair) return;
+    if (!publicKey || !poll || stateIndex == null || !coordinatorPubKey || !isRegistered) return;
 
     // check if the votes are valid
     if (isAnyInvalid) {
@@ -127,63 +202,41 @@ export default function PollDetail({ id }: { id: bigint }) {
       return;
     }
 
-    const votesToMessage = votes.map((v, i) =>
-      getMessageAndEncKeyPair(
+    const votesToMessage = votes.map((v, i) => ({
+      messageHash: getMessage(
         stateIndex,
         poll.id,
         BigInt(v.index),
         BigInt(v.votes),
         BigInt(votes.length - i),
-        coordinatorPubKey,
-        keypair,
+        publicKey,
       ),
+      pollIndex: poll.id,
+      candidateIndex: BigInt(v.index),
+      weight: BigInt(v.votes),
+      nonce: BigInt(votes.length - i),
+    }));
+
+    const signatureId = signMessage(
+      { pollId: Number(poll.id), title: poll?.name, selectedOption: poll?.options[Number(votes[0].index)] },
+      votesToMessage[0].messageHash,
     );
+    if (!signatureId) return;
 
-    try {
-      if (votesToMessage.length === 1) {
-        await publishMessage({
-          args: [
-            votesToMessage[0].message.asContractParam() as unknown as {
-              msgType: bigint;
-              data: readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
-            },
-            votesToMessage[0].encKeyPair.pubKey.asContractParam() as unknown as { x: bigint; y: bigint },
-          ],
-        });
-      } else {
-        await publishMessageBatch({
-          args: [
-            votesToMessage.map(
-              v =>
-                v.message.asContractParam() as unknown as {
-                  msgType: bigint;
-                  data: readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint];
-                },
-            ),
-            votesToMessage.map(v => v.encKeyPair.pubKey.asContractParam() as { x: bigint; y: bigint }),
-          ],
-        });
-      }
-
-      notification.success("Vote casted successfully");
-    } catch (err) {
-      console.log("err", err);
-      notification.error("Casting vote failed, please try again ");
-    }
+    setRequiredSignatures({ messages: votesToMessage, signatureId });
   };
 
-  function getMessageAndEncKeyPair(
+  function getMessage(
     stateIndex: bigint,
     pollIndex: bigint,
     candidateIndex: bigint,
     weight: bigint,
     nonce: bigint,
-    coordinatorPubKey: PubKey,
-    keypair: Keypair,
+    publicKey: PubKey,
   ) {
     const command: PCommand = new PCommand(
       stateIndex,
-      keypair.pubKey,
+      publicKey,
       candidateIndex,
       weight,
       nonce,
@@ -191,11 +244,34 @@ export default function PollDetail({ id }: { id: bigint }) {
       genRandomSalt(),
     );
 
-    const signature = command.sign(keypair.privKey);
+    return command.hash().toString();
+  }
+
+  function encryptSignature(
+    stateIndex: bigint,
+    pollIndex: bigint,
+    candidateIndex: bigint,
+    weight: bigint,
+    nonce: bigint,
+    coordinatorPubKey: PubKey,
+    publicKey: PubKey,
+    signature: string,
+  ) {
+    const command: PCommand = new PCommand(
+      stateIndex,
+      publicKey,
+      candidateIndex,
+      weight,
+      nonce,
+      pollIndex,
+      genRandomSalt(),
+    );
 
     const encKeyPair = new Keypair();
 
-    const message = command.encrypt(signature, Keypair.genEcdhSharedKey(encKeyPair.privKey, coordinatorPubKey));
+    const formatedSignature: Signature = JSON.parse(signature);
+
+    const message = command.encrypt(formatedSignature, Keypair.genEcdhSharedKey(encKeyPair.privKey, coordinatorPubKey));
 
     return { message, encKeyPair };
   }
@@ -277,6 +353,7 @@ export default function PollDetail({ id }: { id: bigint }) {
           </div>
         )}
       </div>
+      {pendingSignatureId !== null && pendingSignatureId !== lastSignature?.signatureId && <VoteInProgress />}
     </div>
   );
 }

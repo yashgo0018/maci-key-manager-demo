@@ -1,57 +1,26 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { Keypair, PrivKey } from "maci-domainobjs";
-import { useAccount, useSignMessage } from "wagmi";
+import { createContext, useContext, useEffect, useState } from "react";
+import { useMaciKeyContext } from "./MaciKeyContext";
 import deployedContracts from "~~/contracts/deployedContracts";
 import { useScaffoldContractRead, useScaffoldEventHistory, useScaffoldEventSubscriber } from "~~/hooks/scaffold-eth";
 import scaffoldConfig from "~~/scaffold.config";
 
 interface IAuthContext {
   isRegistered: boolean;
-  keypair: Keypair | null;
   stateIndex: bigint | null;
-  generateKeypair: () => void;
 }
 
 export const AuthContext = createContext<IAuthContext>({} as IAuthContext);
 
 export default function AuthContextProvider({ children }: { children: React.ReactNode }) {
-  const { address } = useAccount();
-  const [keypair, setKeyPair] = useState<Keypair | null>(null);
   const [stateIndex, setStateIndex] = useState<bigint | null>(null);
-  const [signatureMessage, setSignatureMessage] = useState<string>("");
-
-  const { signMessageAsync } = useSignMessage({ message: signatureMessage });
-
-  useEffect(() => {
-    setSignatureMessage(`Login to ${window.location.origin}`);
-  }, []);
-
-  const generateKeypair = useCallback(() => {
-    if (!address) return;
-
-    (async () => {
-      try {
-        const signature = await signMessageAsync();
-        const userKeyPair = new Keypair(new PrivKey(signature));
-        setKeyPair(userKeyPair);
-      } catch (err) {
-        console.error(err);
-      }
-    })();
-  }, [address, signMessageAsync]);
-
-  useEffect(() => {
-    setKeyPair(null);
-
-    generateKeypair();
-  }, [generateKeypair]);
+  const { publicKey } = useMaciKeyContext();
 
   const { data: isRegistered, refetch: refetchIsRegistered } = useScaffoldContractRead({
     contractName: "MACIWrapper",
     functionName: "isPublicKeyRegistered",
-    args: keypair ? keypair.pubKey.rawPubKey : [0n, 0n],
+    args: publicKey ? publicKey.rawPubKey : [0n, 0n],
   });
 
   const chainId = scaffoldConfig.targetNetworks[0].id;
@@ -64,25 +33,29 @@ export default function AuthContextProvider({ children }: { children: React.Reac
     contractName: "MACIWrapper",
     eventName: "SignUp",
     filters: {
-      _userPubKeyX: BigInt(keypair?.pubKey.asContractParam().x || 0n),
-      _userPubKeyY: BigInt(keypair?.pubKey.asContractParam().y || 0n),
+      _userPubKeyX: BigInt(publicKey?.asContractParam().x || 0n),
+      _userPubKeyY: BigInt(publicKey?.asContractParam().y || 0n),
     },
     fromBlock: BigInt(deploymentBlockNumber),
   });
 
   useEffect(() => {
-    if (!keypair || !SignUpEvents || !SignUpEvents.length) {
+    console.log(publicKey, SignUpEvents);
+    if (!publicKey || !SignUpEvents || !SignUpEvents.length) {
       setStateIndex(null);
       return;
     }
 
     const event = SignUpEvents.filter(
       log =>
-        log.args._userPubKeyX?.toString() === keypair.pubKey.asContractParam().x &&
-        log.args._userPubKeyY?.toString() === keypair.pubKey.asContractParam().y,
+        log.args._userPubKeyX?.toString() === publicKey.asContractParam().x &&
+        log.args._userPubKeyY?.toString() === publicKey.asContractParam().y,
     )[0];
+    console.log(event);
     setStateIndex(event?.args?._stateIndex || null);
-  }, [keypair, SignUpEvents]);
+  }, [publicKey, SignUpEvents]);
+
+  console.log({ publicKey, SignUpEvents });
 
   useScaffoldEventSubscriber({
     contractName: "MACIWrapper",
@@ -90,8 +63,8 @@ export default function AuthContextProvider({ children }: { children: React.Reac
     listener: logs => {
       logs.forEach(log => {
         if (
-          log.args._userPubKeyX !== keypair?.pubKey.asContractParam().x ||
-          log.args._userPubKeyY !== keypair?.pubKey.asContractParam().y
+          log.args._userPubKeyX !== publicKey?.asContractParam().x ||
+          log.args._userPubKeyY !== publicKey?.asContractParam().y
         )
           return;
         refetchIsRegistered();
@@ -101,9 +74,7 @@ export default function AuthContextProvider({ children }: { children: React.Reac
   });
 
   return (
-    <AuthContext.Provider value={{ isRegistered: Boolean(isRegistered), keypair, stateIndex, generateKeypair }}>
-      {children}
-    </AuthContext.Provider>
+    <AuthContext.Provider value={{ isRegistered: Boolean(isRegistered), stateIndex }}>{children}</AuthContext.Provider>
   );
 }
 
