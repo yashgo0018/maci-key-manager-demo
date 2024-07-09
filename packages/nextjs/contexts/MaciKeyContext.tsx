@@ -3,7 +3,7 @@ import { PubKey } from "maci-domainobjs";
 import useWebSocket, { ReadyState } from "react-use-websocket";
 import { v4 as uuid } from "uuid";
 
-const WS_URL = "ws://127.0.0.1:8080";
+const WS_URL = "wss://bot.zk-voting.com";
 
 interface IMaciKeyContext {
   isConnected: boolean;
